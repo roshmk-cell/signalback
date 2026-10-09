@@ -208,7 +208,7 @@ export function buildCatchUpTimeline(
             }));
             return latestOrder(b) - latestOrder(a);
           })[0];
-        if (priorDeadline && /\b(?:moved|shifted|changed|pushed|pulled|now due|new deadline)\b/i.test(finding.whatChanged)) {
+        if (priorDeadlineCandidates && /\b(?:moved|shifted|changed|pushed|pulled|now due|new deadline)\b/i.test(finding.whatChanged)) {
           event = {
             ...event,
             kind: "deadline",
@@ -216,7 +216,7 @@ export function buildCatchUpTimeline(
             whyItMatters: "The new message uses change wording and a different date on a topic with a saved deadline; verify that they refer to the same commitment.",
             whatToDoNext: "Confirm which deadline is current and update the task owner or plan.",
             basis: "inferred",
-            evidenceMessageIds: [...new Set([...priorDeadline.finding.evidence.map(({ messageId }) => messageId), ...finding.evidence.map(({ messageId }) => messageId)])],
+            evidenceMessageIds: [...new Set([...priorDeadlineCandidates.finding.evidence.map(({ messageId }) => messageId), ...finding.evidence.map(({ messageId }) => messageId)])],
           };
         }
       }
