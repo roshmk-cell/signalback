@@ -9,10 +9,7 @@
     "lint": "eslint"
   },
   "dependencies": {
-<<<<<<< HEAD
     "@google/genai": "^2.28.0",
-=======
->>>>>>> aa276407a385b0cdb3cbeda3c6c2bfc8a576344c
     "next": "16.4.0",
     "react": "19.3.0",
     "react-dom": "19.3.0"
