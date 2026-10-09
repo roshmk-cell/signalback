@@ -221,16 +221,18 @@ export function parseChatText(
   };
 }
 
-const SAMPLE_TEXT = `2026-10-08, 09:10 - Maya: We planned to send the partner preview on Friday, October 16.
-2026-10-08, 09:14 - Leo: The vendor moved their review to Wednesday, October 14, so we need the preview ready by Tuesday, October 13.
+const SAMPLE_BASELINE_TEXT = `2026-10-08, 09:10 - Maya: The vendor review is due Friday, October 16.
 2026-10-08, 09:17 - Priya: I will update the preview copy and send it for review by Monday, October 12.
 2026-10-08, 09:20 - Leo: I am blocked on the final pricing table; Finance has not sent the approved numbers yet.
 2026-10-08, 09:26 - Maya: Agreed: use the current approved prices for this preview, then replace them after Finance confirms.
 2026-10-08, 09:29 - Priya: I will mark the preview as provisional so nobody treats those prices as final.`;
 
+const SAMPLE_UPDATE_TEXT = `${SAMPLE_BASELINE_TEXT}
+2026-10-09, 10:05 - Leo: The vendor moved the review from Friday, October 16, to Wednesday, October 14. The preview now needs to be ready by Tuesday, October 13.`;
+
 /** Sample input is parsed by the same public parser as user-imported text. */
 export function loadSampleConversation(): ParseConversationResult {
-  const result = parseChatText(SAMPLE_TEXT, "signalback-sample");
+  const result = parseChatText(SAMPLE_BASELINE_TEXT, "signalback-sample");
   if (!result.ok) {
     // A compile-time-owned constant should always parse; preserve result shape if edited incorrectly.
     return {
@@ -245,6 +247,21 @@ export function loadSampleConversation(): ParseConversationResult {
     ok: true,
     conversation: { ...result.conversation, source: "sample" },
   };
+}
+
+/** Full updated export used by the opt-in sample comparison demonstration. */
+export function loadSampleUpdateConversation(): ParseConversationResult {
+  const result = parseChatText(SAMPLE_UPDATE_TEXT, "signalback-sample");
+  if (!result.ok) {
+    return {
+      ok: false,
+      error: {
+        code: "malformed-input",
+        message: `Signalback's built-in sample update is invalid: ${result.error.message}`,
+      },
+    };
+  }
+  return { ok: true, conversation: { ...result.conversation, source: "sample" } };
 }
 
 function stableFindingId(category: FindingCategory, evidenceIds: readonly string[]): string {
@@ -290,6 +307,62 @@ const TASK_PATTERN =
 const DATE_TOKEN_PATTERN =
   /\b(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday|january|february|march|april|may|june|july|august|september|october|november|december)\b|\b\d{1,2}[/-]\d{1,2}(?:[/-]\d{2,4})?\b/i;
 
+const MONTHS = [
+  "january", "february", "march", "april", "may", "june",
+  "july", "august", "september", "october", "november", "december",
+] as const;
+
+function deadlineCue(text: string): string | null {
+  return DEADLINE_PATTERN.exec(text)?.[0]?.trim() ?? null;
+}
+
+function dateFromCue(cue: string, sourceYear: number | undefined): Date | null {
+  const monthDate = /\b(january|february|march|april|may|june|july|august|september|october|november|december)\s+(\d{1,2})(?:,?\s+(\d{4}))?\b/i.exec(cue);
+  if (!monthDate) return null;
+  const month = MONTHS.indexOf(monthDate[1].toLocaleLowerCase() as (typeof MONTHS)[number]);
+  const day = Number(monthDate[2]);
+  const year = Number(monthDate[3]) || sourceYear;
+  if (month < 0 || !year) return null;
+  const date = new Date(year, month, day);
+  return date.getFullYear() === year && date.getMonth() === month && date.getDate() === day
+    ? date
+    : null;
+}
+
+/** Return a date only when a finding's source explicitly states a calendar date. */
+export function getFindingDueDate(
+  finding: FindingCandidate,
+  messages: readonly ChatMessage[],
+): Date | null {
+  if (!["deadline", "changed-plan", "task"].includes(finding.category) || finding.whatChangedBasis !== "explicit") return null;
+  const byId = new Map(messages.map((message) => [message.id, message]));
+  for (const { messageId } of finding.evidence) {
+    const message = byId.get(messageId);
+    if (!message) continue;
+    const source = message.originalText;
+    const cue = deadlineCue(source);
+    if (cue) {
+      const sourceYear = message.timestamp ? Number(message.timestamp.slice(0, 4)) : undefined;
+      const parsed = dateFromCue(cue, sourceYear);
+      if (parsed) return parsed;
+    }
+    if (finding.category === "changed-plan") {
+      const changeTarget = PLAN_CHANGE_PATTERN.exec(source)?.[1];
+      if (changeTarget) {
+        const parsed = dateFromCue(changeTarget, message.timestamp ? Number(message.timestamp.slice(0, 4)) : undefined);
+        if (parsed) return parsed;
+      }
+    }
+  }
+  return null;
+}
+
+function daysFromToday(date: Date, today: Date): number {
+  const due = Date.UTC(date.getFullYear(), date.getMonth(), date.getDate());
+  const current = Date.UTC(today.getFullYear(), today.getMonth(), today.getDate());
+  return Math.round((due - current) / 86_400_000);
+}
+
 /** Conservative local rules; these rules are not an AI model. */
 export class RuleBasedAnalysisProvider implements AnalysisProvider {
   readonly id = "rules" as const;
@@ -302,23 +375,28 @@ export class RuleBasedAnalysisProvider implements AnalysisProvider {
       if (!text) continue;
 
       const changed = PLAN_CHANGE_PATTERN.exec(text);
+      const task = TASK_PATTERN.exec(text);
       if (changed && /\b(?:from|moved|shifted|changed|pushed|pulled)\b/i.test(text)) {
         candidates.push(candidate(
           "changed-plan", message,
           text,
           "A stated plan changed, which may affect preparation and handoffs.",
-          `Confirm the new plan and update affected work: ${changed[1].trim()}`,
+          deadlineCue(text)
+            ? `Update the handoff to meet the deadline ${deadlineCue(text)}.`
+            : `Confirm the new plan with the people handling the handoff to ${changed[1].trim()}.`,
           "Explicit plan-change wording matched.",
         ));
       }
 
       const deadline = DEADLINE_PATTERN.exec(text);
-      if (deadline) {
+      // A date attached to a task or changed plan enriches that one finding;
+      // a second deadline card for the same source message is redundant.
+      if (deadline && !task && !changed) {
         candidates.push(candidate(
           "deadline", message,
           text,
           "A time-bound commitment is stated and may affect work sequencing.",
-          `Track the stated deadline: ${deadline[0].trim()}`,
+          `Make sure the team is ready ${deadline[0].trim()}.`,
           "Explicit deadline wording and date/time matched.",
         ));
       }
@@ -336,26 +414,38 @@ export class RuleBasedAnalysisProvider implements AnalysisProvider {
 
       const decision = DECISION_PATTERN.exec(text);
       if (decision) {
+        const decisionText = decision[1].replace(/^[:\s]+/, "").trim();
+        const keepChoice = /\buse\s+(.+?),?\s+then\s+replace\b/i.exec(decisionText)?.[1]?.trim();
+        const replacement = /\bthen\s+replace\s+(.+?)\s+after\b/i.exec(decisionText)?.[1]?.trim();
+        const confirmation = /\bafter\s+(.+?)(?:[.!?]|$)/i.exec(decisionText)?.[1]?.trim();
         candidates.push(candidate(
           "decision", message,
-          text,
+          decisionText,
           "An explicit agreement or decision can change what the team should treat as current.",
-          `Use the stated decision: ${decision[1].trim()}`,
+          keepChoice && replacement && confirmation
+            ? `Keep ${keepChoice} in place until ${confirmation}; then replace ${replacement}.`
+            : "Share this decision with the people relying on the previous plan.",
           "Explicit decision/agreement wording matched.",
         ));
       }
 
-      const task = TASK_PATTERN.exec(text);
       if (task) {
         const taskDescription = task[1].trim();
         const dateMatches = DATE_TOKEN_PATTERN.test(taskDescription);
+        const cue = deadlineCue(text);
+        const isFirstPersonCommitment = /^\s*i(?:'ll|\s+will)\b/i.test(text);
+        const nextAction = /^\s*please\b/i.test(text)
+          ? `Confirm who owns this request${cue ? ` and whether it is on track ${cue}` : " and when it is due"}.`
+          : isFirstPersonCommitment && message.sender
+            ? `Check with ${message.sender} that this task is complete${cue ? ` ${cue}` : ""}.`
+            : `Confirm that this task is complete${cue ? ` ${cue}` : ""}.`;
         candidates.push(candidate(
           "task", message,
-          text,
+          taskDescription,
           dateMatches
             ? "A person explicitly commits to an action with a date-like detail."
             : "A person explicitly commits to an action.",
-          `Track the stated action: ${taskDescription}`,
+          nextAction,
           "Explicit first-person or polite task wording matched.",
         ));
       }
@@ -368,16 +458,26 @@ export class RuleBasedAnalysisProvider implements AnalysisProvider {
 /** Explainable rank policy, kept independent from parsing and providers. */
 export function prioritizeFindings(
   findings: readonly FindingCandidate[],
+  messages: readonly ChatMessage[] = [],
+  today = new Date(),
 ): Finding[] {
-  const priorityFor = (finding: FindingCandidate): FindingPriority => {
-    if (finding.category === "blocker" || finding.category === "changed-plan") return "high";
-    if (finding.category === "deadline" || finding.category === "decision") return "medium";
-    return "low";
-  };
   const rank: Record<FindingPriority, number> = { high: 0, medium: 1, low: 2 };
   return findings
-    .map((finding) => ({ ...finding, priority: priorityFor(finding) }))
-    .sort((a, b) => rank[a.priority] - rank[b.priority]);
+    .map((finding, index) => {
+      const dueDate = getFindingDueDate(finding, messages);
+      const dueInDays = dueDate ? daysFromToday(dueDate, today) : undefined;
+      const priority: FindingPriority = finding.category === "blocker" || dueInDays !== undefined && dueInDays <= 2
+        ? "high"
+        : dueInDays !== undefined
+          ? dueInDays <= 7 ? "medium" : "low"
+          : finding.category === "changed-plan" || finding.category === "deadline" || finding.category === "decision"
+            ? "medium"
+            : "low";
+      return { finding, priority, dueInDays, order: index };
+    })
+    .sort((a, b) => rank[a.priority] - rank[b.priority] ||
+      (a.dueInDays ?? Number.POSITIVE_INFINITY) - (b.dueInDays ?? Number.POSITIVE_INFINITY) || a.order - b.order)
+    .map(({ finding, priority }) => ({ ...finding, priority }));
 }
 
 function validateAndPrioritize(
@@ -430,7 +530,7 @@ function validateAndPrioritize(
     valid.push(value as FindingCandidate);
   }
 
-  return { findings: prioritizeFindings(valid), issues };
+  return { findings: prioritizeFindings(valid, messages), issues };
 }
 
 /** Run provider analysis, validate against this conversation, then rank results. */

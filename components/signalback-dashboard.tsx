@@ -10,7 +10,9 @@ import {
 } from "react";
 import {
   analyzeConversation,
+  getFindingDueDate,
   loadSampleConversation,
+  loadSampleUpdateConversation,
   parseChatText,
   type AnalysisIssue,
   type AnalysisResult,
@@ -22,6 +24,7 @@ import {
 } from "@/lib/signalback";
 import {
   MEMORY_STORAGE_KEY,
+  MEMORY_SCHEMA_VERSION,
   buildCatchUpTimeline,
   findingSignature,
   matchImport,
@@ -31,6 +34,7 @@ import {
   stabilizeConversation,
   type FindingStatus,
   type SavedConversationMemory,
+  type TimelineEvent,
 } from "@/lib/signalback-memory";
 
 type StatusFilter = "unresolved" | "resolved" | "all";
@@ -100,17 +104,9 @@ function SelectFilter({
 }
 
 function isUpcomingConfirmedDeadline(finding: Finding, messages: ReadonlyMap<string, ChatMessage>): boolean {
-  if (finding.category !== "deadline" || finding.whatChangedBasis !== "explicit") return false;
-  const text = finding.whatChanged;
-  const match = /\b(january|february|march|april|may|june|july|august|september|october|november|december)\s+(\d{1,2})(?:,?\s+(\d{4}))?\b/i.exec(text);
-  if (!match) return false;
-  const month = new Date(`${match[1]} 1, 2000`).getMonth();
-  const sourceYear = finding.evidence
-    .map(({ messageId }) => messages.get(messageId)?.timestamp)
-    .find((timestamp): timestamp is string => Boolean(timestamp))
-    ?.slice(0, 4);
-  const year = Number(match[3]) || (sourceYear ? Number(sourceYear) : new Date().getFullYear());
-  const date = new Date(year, month, Number(match[2]));
+  if (finding.whatChangedBasis !== "explicit") return false;
+  const date = getFindingDueDate(finding, [...messages.values()]);
+  if (!date) return false;
   const today = new Date();
   today.setHours(0, 0, 0, 0);
   return Number.isFinite(date.getTime()) && date >= today;
@@ -256,6 +252,9 @@ export default function SignalbackDashboard() {
   const [findingStatuses, setFindingStatuses] = useState<Record<string, FindingStatus>>({});
   const [reviewedIds, setReviewedIds] = useState<Set<string>>(() => new Set());
   const [dismissedIds, setDismissedIds] = useState<Set<string>>(() => new Set());
+  const [sampleTimeline, setSampleTimeline] = useState<TimelineEvent[]>([]);
+  const [sampleComparisonRan, setSampleComparisonRan] = useState(false);
+  const [sampleNewMessageCount, setSampleNewMessageCount] = useState(0);
   const [expandedTimelineIds, setExpandedTimelineIds] = useState<Set<string>>(() => new Set());
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -371,6 +370,10 @@ export default function SignalbackDashboard() {
       if (thisRequest !== requestId.current) return;
       setAnalysis(result);
       if (next.source === "import") commitImportedAnalysis(next, result, baseline);
+      else if (baseline) {
+        setSampleTimeline(buildCatchUpTimeline(baseline, result.findings, next.messages));
+        setSampleComparisonRan(true);
+      }
       setAnnouncement(`Analysis complete. ${result.findings.length} verified findings.`);
     } catch (caught) {
       if (thisRequest !== requestId.current) return;
@@ -423,6 +426,10 @@ export default function SignalbackDashboard() {
       setAnalysis(result);
       setExpandedIds(new Set());
       if (next.source === "import") commitImportedAnalysis(next, result, baseline);
+      else if (baseline) {
+        setSampleTimeline(buildCatchUpTimeline(baseline, result.findings, next.messages));
+        setSampleComparisonRan(true);
+      }
       setAnnouncement(`Gemini analysis complete. ${result.findings.length} findings with verified evidence references.`);
     } catch (caught) {
       if (thisRequest !== requestId.current) return;
@@ -437,6 +444,9 @@ export default function SignalbackDashboard() {
     ++requestId.current;
     comparisonBaselineRef.current = null;
     activeImportTimeRef.current = null;
+    setSampleTimeline([]);
+    setSampleComparisonRan(false);
+    setSampleNewMessageCount(0);
     setPendingImport(null);
     setConversation(next);
     setAnalysis(null);
@@ -471,6 +481,9 @@ export default function SignalbackDashboard() {
     ++requestId.current;
     comparisonBaselineRef.current = baseline;
     activeImportTimeRef.current = new Date().toISOString();
+    setSampleTimeline([]);
+    setSampleComparisonRan(false);
+    setSampleNewMessageCount(0);
     setConversation(next);
     setAnalysis(baseline
       ? { provider: baseline.lastProvider, findings: baseline.findings.map(({ finding }) => finding), issues: [] }
@@ -543,7 +556,63 @@ export default function SignalbackDashboard() {
       setError(sample.error.message);
       return;
     }
-    await activateConversation(sample.conversation);
+    await activateConversation(stabilizeConversation(sample.conversation));
+  }
+
+  async function handleSampleComparison() {
+    if (!conversation || conversation.source !== "sample" || !analysis || sampleComparisonRan) return;
+    const update = loadSampleUpdateConversation();
+    if (!update.ok) {
+      setError(update.error.message);
+      return;
+    }
+
+    const updatedConversation = stabilizeConversation(update.conversation);
+    const now = new Date().toISOString();
+    const baseline: SavedConversationMemory = {
+      schemaVersion: MEMORY_SCHEMA_VERSION,
+      conversationId: conversation.id,
+      messages: conversation.messages,
+      findings: analysis.findings.map((finding) => ({
+        finding,
+        provider: analysis.provider,
+        status: findingStatuses[finding.id] ?? "new",
+        reviewed: reviewedIds.has(finding.id),
+      })),
+      timeline: sampleTimeline,
+      dismissedTimelineIds: [...dismissedIds],
+      firstImportedAt: now,
+      lastImportedAt: now,
+      lastAnalyzedAt: now,
+      lastProvider: analysis.provider,
+      lastNewMessageCount: 0,
+      comparisonCount: 0,
+    };
+
+    comparisonBaselineRef.current = baseline;
+    activeImportTimeRef.current = null;
+    setConversation(updatedConversation);
+    setAnalysis(null);
+    setError(null);
+    setSampleTimeline([]);
+    setSampleComparisonRan(false);
+    setSampleNewMessageCount(updatedConversation.messages.length - conversation.messages.length);
+    setFindingStatuses(Object.fromEntries(baseline.findings.map(({ finding, status }) => [finding.id, status])));
+    setReviewedIds(new Set(baseline.findings.filter(({ reviewed }) => reviewed).map(({ finding }) => finding.id)));
+    setDismissedIds(new Set());
+    setExpandedIds(new Set());
+    setExpandedTimelineIds(new Set());
+    setCategoryFilter("all");
+    setPriorityFilter("all");
+    setStatusFilter("unresolved");
+    setRemoteConsent(false);
+
+    if (analysisMode === "rules") {
+      await runLocal(updatedConversation, baseline);
+    } else {
+      setBusy(false);
+      setAnnouncement("The updated sample is ready. Review the Gemini privacy notice and explicitly run remote analysis to compare it.");
+    }
   }
 
   function resolvePendingImport(choice: "compare" | "new") {
@@ -628,6 +697,7 @@ export default function SignalbackDashboard() {
   const messages = conversation?.messages ?? [];
   const messagesById = new Map(messages.map((message) => [message.id, message]));
   const activeMemory = conversation?.source === "import" && memory?.conversationId === conversation.id ? memory : null;
+  const sampleComparisonActive = conversation?.source === "sample" && sampleComparisonRan;
   const memoryRecords = activeMemory?.findings ?? [];
   const findingMap = new Map(memoryRecords.map(({ finding }) => [finding.id, finding]));
   for (const finding of analysis?.findings ?? []) findingMap.set(finding.id, finding);
@@ -648,9 +718,20 @@ export default function SignalbackDashboard() {
   const unresolvedCount = allFindings.filter(({ id }) => getStatus(id) !== "completed").length;
   const resolvedCount = allFindings.length - unresolvedCount;
   const rejectedIssues: AnalysisIssue[] = analysis?.issues ?? [];
-  const visibleTimeline = activeMemory?.timeline.filter((event) => !dismissedIds.has(event.id)) ?? [];
+  const timeline = activeMemory?.timeline ?? (sampleComparisonActive ? sampleTimeline : []);
+  const visibleTimeline = timeline.filter((event) => !dismissedIds.has(event.id));
+  const supersededDeadlineFindingIds = new Set(allFindings
+    .filter((finding) => finding.category === "deadline")
+    .filter((finding) => timeline.some((event) =>
+      event.kind === "deadline" && event.basis === "inferred" &&
+      event.whatChanged.startsWith("Likely deadline change:") &&
+      event.findingId !== finding.id &&
+      finding.evidence.some(({ messageId }) => event.evidenceMessageIds.includes(messageId)),
+    ))
+    .map(({ id }) => id));
   const upcomingDeadlines = allFindings.filter((finding) =>
-    getStatus(finding.id) !== "completed" && isUpcomingConfirmedDeadline(finding, messagesById),
+    getStatus(finding.id) !== "completed" && !supersededDeadlineFindingIds.has(finding.id) &&
+    isUpcomingConfirmedDeadline(finding, messagesById),
   );
   const activeTasks = allFindings.filter((finding) => finding.category === "task" && getStatus(finding.id) !== "completed");
   const blockedItems = allFindings.filter((finding) =>
@@ -722,6 +803,11 @@ export default function SignalbackDashboard() {
             <span className="sample-text"><strong>Explore the sample</strong><small>A project handoff, with a twist</small></span>
             <span className="button-arrow" aria-hidden="true">↗</span>
           </button>
+          {conversation?.source === "sample" && analysis && !sampleComparisonRan && (
+            <button className="sample-comparison-button" type="button" onClick={() => void handleSampleComparison()} disabled={busy}>
+              See what changed in an updated sample <span aria-hidden="true">→</span>
+            </button>
+          )}
 
           <div className="import-card">
             <div className="import-icon" aria-hidden="true">↑</div>
@@ -822,20 +908,23 @@ export default function SignalbackDashboard() {
             )}
           </div>
 
-          {conversation?.source === "import" && activeMemory && analysis && !busy && (
+          {((conversation?.source === "import" && activeMemory) || sampleComparisonActive) && analysis && !busy && (
             <section className="catchup-panel" aria-labelledby="catchup-title">
               <div className="memory-section-heading">
-                <div><span className="section-kicker">MEMORY · 03</span><h3 id="catchup-title">Since your last check</h3></div>
-                <span className="memory-timestamp">{new Date(activeMemory.lastImportedAt).toLocaleDateString()}</span>
+                <div><span className="section-kicker">{sampleComparisonActive ? "SAMPLE COMPARISON · NOT SAVED" : "MEMORY · 03"}</span><h3 id="catchup-title">Since your last check</h3></div>
+                <span className="memory-timestamp">{sampleComparisonActive ? "Baseline → updated" : new Date(activeMemory!.lastImportedAt).toLocaleDateString()}</span>
               </div>
-              {activeMemory.comparisonCount === 0 ? (
+              {!sampleComparisonActive && activeMemory?.comparisonCount === 0 ? (
                 <div className="memory-empty-state">
                   <strong>Your first catch-up is ready.</strong>
                   <p>This import is the starting baseline. Signalback will compare your next export with these saved messages and findings.</p>
                 </div>
               ) : (
                 <>
-                  {activeMemory.lastNewMessageCount > 0 && (
+                  {sampleComparisonActive && sampleNewMessageCount > 0 && (
+                    <p className="observed-message-note">The updated sample adds {sampleNewMessageCount} message. Its timestamp is illustrative demo data.</p>
+                  )}
+                  {!sampleComparisonActive && activeMemory && activeMemory.lastNewMessageCount > 0 && (
                     <p className="observed-message-note">{activeMemory.lastNewMessageCount} message{activeMemory.lastNewMessageCount === 1 ? " was" : "s were"} newly observed in this export. The export does not establish when they arrived.</p>
                   )}
                   {visibleTimeline.length ? (
