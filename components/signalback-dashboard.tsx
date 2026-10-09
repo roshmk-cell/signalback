@@ -1,6 +1,7 @@
 "use client";
 
 import {
+  startTransition,
   useEffect,
   useRef,
   useState,
@@ -58,6 +59,10 @@ const PRIORITY_LABEL: Record<FindingPriority, string> = {
   medium: "Medium priority",
   low: "Lower priority",
 };
+
+function statusLabel(status: FindingStatus): string {
+  return status === "new" ? "Open" : status === "in-progress" ? "In progress" : status === "completed" ? "Completed" : "Blocked";
+}
 
 function formatTimestamp(message: ChatMessage): string {
   if (!message.timestampText) return `Message ${message.sourceOrder + 1}`;
@@ -123,6 +128,8 @@ function FindingsCard({
   status,
   reviewed,
   savedProvider,
+  animateEntrance,
+  onEntranceComplete,
   expanded,
   onStatusChange,
   onToggleReviewed,
@@ -133,6 +140,8 @@ function FindingsCard({
   status: FindingStatus;
   reviewed: boolean;
   savedProvider?: string;
+  animateEntrance: boolean;
+  onEntranceComplete: (findingId: string) => void;
   expanded: boolean;
   onStatusChange: (status: FindingStatus) => void;
   onToggleReviewed: () => void;
@@ -143,7 +152,12 @@ function FindingsCard({
     .filter((message): message is ChatMessage => Boolean(message));
 
   return (
-    <article className={`finding-card priority-${finding.priority}${status === "completed" ? " is-resolved" : ""}`}>
+    <article
+      className={`finding-card priority-${finding.priority}${status === "completed" ? " is-resolved" : ""}${expanded ? " has-open-evidence" : ""}${animateEntrance ? " motion-enter" : ""}`}
+      onAnimationEnd={(event) => {
+        if (event.target === event.currentTarget && animateEntrance) onEntranceComplete(finding.id);
+      }}
+    >
       <div className="finding-topline">
         <div className="finding-tags">
           <span className={`priority-pill ${finding.priority}`}>
@@ -211,21 +225,23 @@ function FindingsCard({
         </div>
       </div>
 
-      {expanded && (
-        <div className="evidence-list" aria-label="Original supporting messages">
-          {evidenceMessages.length ? evidenceMessages.map((message) => (
-            <figure className="evidence-message" key={message.id}>
-              <figcaption>
-                <span className="evidence-sender">{message.sender || "Unknown sender"}</span>
-                <time>{formatTimestamp(message)}</time>
-              </figcaption>
-              <blockquote>{message.originalText}</blockquote>
-            </figure>
-          )) : (
-            <p className="inline-warning">Source messages are unavailable for this finding.</p>
-          )}
+      <div className={`evidence-disclosure${expanded ? " is-open" : ""}`} aria-hidden={!expanded}>
+        <div className="evidence-disclosure-inner">
+          <div className="evidence-list" aria-label="Original supporting messages">
+            {evidenceMessages.length ? evidenceMessages.map((message) => (
+              <figure className="evidence-message" key={message.id}>
+                <figcaption>
+                  <span className="evidence-sender">{message.sender || "Unknown sender"}</span>
+                  <time>{formatTimestamp(message)}</time>
+                </figcaption>
+                <blockquote>{message.originalText}</blockquote>
+              </figure>
+            )) : (
+              <p className="inline-warning">Source messages are unavailable for this finding.</p>
+            )}
+          </div>
         </div>
-      )}
+      </div>
     </article>
   );
 }
@@ -253,6 +269,7 @@ export default function SignalbackDashboard() {
   const [remoteConsent, setRemoteConsent] = useState(false);
   const importRef = useRef<HTMLInputElement>(null);
   const requestId = useRef(0);
+  const [animatedFindingIds, setAnimatedFindingIds] = useState<Set<string>>(() => new Set());
   const comparisonBaselineRef = useRef<SavedConversationMemory | null>(null);
   const activeImportTimeRef = useRef<string | null>(null);
 
@@ -261,28 +278,34 @@ export default function SignalbackDashboard() {
       const loaded = readMemory(window.localStorage.getItem(MEMORY_STORAGE_KEY));
       if (loaded.invalid) {
         window.localStorage.removeItem(MEMORY_STORAGE_KEY);
-        setMemoryNotice("Saved memory could not be read and was cleared. Import the conversation again to start a fresh baseline.");
+        startTransition(() => {
+          setMemoryNotice("Saved memory could not be read and was cleared. Import the conversation again to start a fresh baseline.");
+        });
       }
       if (loaded.memory) {
         const saved = loaded.memory;
         comparisonBaselineRef.current = saved;
         activeImportTimeRef.current = saved.lastImportedAt;
-        setMemory(saved);
-        setConversation({
-          id: saved.conversationId,
-          source: "import",
-          format: "signalback-whatsapp-text-v1",
-          messages: saved.messages,
+        startTransition(() => {
+          setMemory(saved);
+          setConversation({
+            id: saved.conversationId,
+            source: "import",
+            format: "signalback-whatsapp-text-v1",
+            messages: saved.messages,
+          });
+          setAnalysis({ provider: saved.lastProvider, findings: saved.findings.map(({ finding }) => finding), issues: [] });
+          setFindingStatuses(Object.fromEntries(saved.findings.map(({ finding, status }) => [finding.id, status])));
+          setReviewedIds(new Set(saved.findings.filter(({ reviewed }) => reviewed).map(({ finding }) => finding.id)));
+          setDismissedIds(new Set(saved.dismissedTimelineIds));
         });
-        setAnalysis({ provider: saved.lastProvider, findings: saved.findings.map(({ finding }) => finding), issues: [] });
-        setFindingStatuses(Object.fromEntries(saved.findings.map(({ finding, status }) => [finding.id, status])));
-        setReviewedIds(new Set(saved.findings.filter(({ reviewed }) => reviewed).map(({ finding }) => finding.id)));
-        setDismissedIds(new Set(saved.dismissedTimelineIds));
       }
     } catch {
-      setMemoryNotice("Browser storage is unavailable. This session will work, but changes cannot be remembered after it closes.");
+      startTransition(() => {
+        setMemoryNotice("Browser storage is unavailable. This session will work, but changes cannot be remembered after it closes.");
+      });
     } finally {
-      setMemoryReady(true);
+      startTransition(() => setMemoryReady(true));
     }
   }, []);
 
@@ -667,7 +690,11 @@ export default function SignalbackDashboard() {
                     ? "Gemini selected · not sent"
                     : "Local rule-based analysis"}
           </span>
-          <a className="topbar-link" href="#how-it-works">How it works <span aria-hidden="true">↗</span></a>
+          <nav className="product-nav" aria-label="Main navigation">
+            <a href="#overview">Overview</a>
+            <a href="#conversation">Conversation</a>
+            <a href="#how-it-works">How it works</a>
+          </nav>
         </div>
       </header>
 
@@ -684,7 +711,7 @@ export default function SignalbackDashboard() {
       </section>
 
       <div className="workspace">
-        <aside className="source-rail" aria-label="Conversation source">
+        <aside className="source-rail" id="conversation" aria-label="Conversation source">
           <div className="rail-heading">
             <span className="section-index">01</span>
             <div><h2>Your conversation</h2><p>Start with a sample or bring your own.</p></div>
@@ -783,7 +810,7 @@ export default function SignalbackDashboard() {
           </div>
         </aside>
 
-        <section className="findings-area" aria-labelledby="findings-title">
+        <section className="findings-area" id="overview" aria-labelledby="findings-title">
           <div className="findings-heading">
             <div>
               <div className="section-kicker"><span className="section-index">02</span> THE BRIEFING</div>
@@ -818,23 +845,28 @@ export default function SignalbackDashboard() {
                           <span className={`timeline-marker ${event.kind}`} aria-hidden="true" />
                           <div className="timeline-copy">
                             <div className="timeline-item-heading"><span>{event.kind === "still-open" ? "Still needs attention" : CATEGORY_LABEL[event.kind]}</span><DisplayBasis basis={event.basis} /></div>
+                            <p className="timeline-field-label">What changed</p>
                             <p className="timeline-change">{event.whatChanged}</p>
+                            <p className="timeline-field-label">Why it matters</p>
                             <p>{event.whyItMatters}</p>
-                            <p className="timeline-next"><strong>Next:</strong> {event.whatToDoNext}</p>
+                            <p className="timeline-field-label">Next move</p>
+                            <p className="timeline-next">{event.whatToDoNext}</p>
                             <div className="timeline-actions">
                               <button type="button" aria-expanded={expandedTimelineIds.has(event.id)} onClick={() => toggleTimelineEvidence(event.id)}>{expandedTimelineIds.has(event.id) ? "Hide source messages" : `Open original evidence (${event.evidenceMessageIds.length})`}</button>
                               <button type="button" onClick={() => dismissTimelineEvent(event.id)}>Dismiss update</button>
                             </div>
-                            {expandedTimelineIds.has(event.id) && (
-                              <div className="timeline-evidence" aria-label="Original messages for this update">
-                                {event.evidenceMessageIds.map((messageId) => messagesById.get(messageId)).filter((message): message is ChatMessage => Boolean(message)).map((message) => (
-                                  <figure className="evidence-message" key={message.id}>
-                                    <figcaption><span className="evidence-sender">{message.sender || "Unknown sender"}</span><time>{formatTimestamp(message)}</time></figcaption>
-                                    <blockquote>{message.originalText}</blockquote>
-                                  </figure>
-                                ))}
+                            <div className={`timeline-evidence-disclosure${expandedTimelineIds.has(event.id) ? " is-open" : ""}`} aria-hidden={!expandedTimelineIds.has(event.id)}>
+                              <div className="evidence-disclosure-inner">
+                                <div className="timeline-evidence" aria-label="Original messages for this update">
+                                  {event.evidenceMessageIds.map((messageId) => messagesById.get(messageId)).filter((message): message is ChatMessage => Boolean(message)).map((message) => (
+                                    <figure className="evidence-message" key={message.id}>
+                                      <figcaption><span className="evidence-sender">{message.sender || "Unknown sender"}</span><time>{formatTimestamp(message)}</time></figcaption>
+                                      <blockquote>{message.originalText}</blockquote>
+                                    </figure>
+                                  ))}
+                                </div>
                               </div>
-                            )}
+                            </div>
                           </div>
                         </article>
                       ))}
@@ -860,7 +892,7 @@ export default function SignalbackDashboard() {
                     .filter((finding, index, all) => all.findIndex((item) => item.id === finding.id) === index)
                     .map((finding) => (
                       <article className="attention-item" key={finding.id}>
-                        <div><span className="attention-category">{CATEGORY_LABEL[finding.category]}</span><span className={`attention-status ${getStatus(finding.id)}`}>{getStatus(finding.id) === "new" ? "Open" : getStatus(finding.id)}</span></div>
+                        <div><span className="attention-category">{CATEGORY_LABEL[finding.category]}</span><span className={`attention-status ${getStatus(finding.id)}`}>{statusLabel(getStatus(finding.id))}</span></div>
                         <p>{finding.whatChanged}</p>
                         <button type="button" onClick={() => openFindingEvidence(finding.id)}>Open source evidence</button>
                       </article>
@@ -899,7 +931,44 @@ export default function SignalbackDashboard() {
 
           {!conversation && !busy && !error && (
             <div className="welcome-panel">
-              <div className="welcome-art" aria-hidden="true"><span className="orbit orbit-one" /><span className="orbit orbit-two" /><span className="signal-core">S</span><span className="signal-spark">✳</span></div>
+              <div className="signal-scene" aria-hidden="true">
+                <svg viewBox="0 0 640 270" role="presentation">
+                  <defs>
+                    <linearGradient id="signal-line" x1="0" x2="1">
+                      <stop offset="0" stopColor="#d1fa55" stopOpacity=".12" />
+                      <stop offset="1" stopColor="#d1fa55" stopOpacity=".75" />
+                    </linearGradient>
+                  </defs>
+                  <g className="message-fragments">
+                    <rect x="18" y="27" width="188" height="42" rx="4" />
+                    <path d="M34 45h90M34 55h143" />
+                    <rect x="132" y="88" width="166" height="43" rx="4" />
+                    <path d="M148 106h91M148 116h126" />
+                    <rect x="27" y="154" width="205" height="43" rx="4" />
+                    <path d="M43 172h112M43 182h155" />
+                    <rect x="344" y="25" width="147" height="42" rx="4" />
+                    <path d="M360 43h74M360 53h112" />
+                    <rect x="390" y="91" width="196" height="43" rx="4" />
+                    <path d="M406 109h126M406 119h152" />
+                  </g>
+                  <g className="signal-connections" fill="none" stroke="url(#signal-line)" strokeWidth="1.2">
+                    <path d="M206 48C286 48 280 112 346 112" />
+                    <path d="M298 110C338 110 338 110 390 110" />
+                    <path d="M232 175C300 175 296 127 346 121" />
+                    <path d="M490 47C526 47 530 82 544 92" />
+                    <path d="M346 116C390 116 400 174 444 174" />
+                    <path d="M346 116C402 116 400 209 444 209" />
+                    <path d="M346 116C410 116 400 244 444 244" />
+                  </g>
+                  <g className="signal-nodes"><circle cx="346" cy="116" r="4" /><circle cx="544" cy="94" r="4" /></g>
+                  <g className="signal-outcomes">
+                    <g transform="translate(444 160)"><rect width="174" height="29" rx="3" /><circle cx="13" cy="14.5" r="3" /><text x="24" y="18">Changed deadline</text></g>
+                    <g transform="translate(444 195)"><rect width="174" height="29" rx="3" /><circle cx="13" cy="14.5" r="3" /><text x="24" y="18">New decision</text></g>
+                    <g transform="translate(444 230)"><rect width="174" height="29" rx="3" /><circle cx="13" cy="14.5" r="3" /><text x="24" y="18">Unresolved action</text></g>
+                  </g>
+                </svg>
+                <p className="scene-caption">DEADLINE <span>·</span> DECISION <span>·</span> ACTION</p>
+              </div>
               <p className="eyebrow">A CLEARER WAY THROUGH THE SCROLL</p>
               <h3>Every thread has a turning point.</h3>
               <p>Load the sample to see how Signalback surfaces a shifted plan, a blocker, and the next move — each tied to the original message.</p>
@@ -928,7 +997,7 @@ export default function SignalbackDashboard() {
 
               {filteredFindings.length > 0 ? (
                 <div className="finding-list">
-                  {filteredFindings.map((finding, index) => (
+                  {filteredFindings.map((finding) => (
                     <FindingsCard
                       key={finding.id}
                       finding={finding}
@@ -936,6 +1005,13 @@ export default function SignalbackDashboard() {
                       status={getStatus(finding.id)}
                       reviewed={isReviewed(finding.id)}
                       savedProvider={analysis.findings.some(({ id }) => id === finding.id) ? undefined : recordById.get(finding.id)?.provider}
+                      animateEntrance={!animatedFindingIds.has(finding.id)}
+                      onEntranceComplete={(findingId) => setAnimatedFindingIds((current) => {
+                        if (current.has(findingId)) return current;
+                        const next = new Set(current);
+                        next.add(findingId);
+                        return next;
+                      })}
                       expanded={expandedIds.has(finding.id)}
                       onStatusChange={(status) => updateFindingStatus(finding, status)}
                       onToggleReviewed={() => toggleReviewed(finding)}
